@@ -22,7 +22,7 @@ dependencies:
   espressif/esp_lcd_touch_ft5x06:
     dependencies: []
     source:
-      path: E:\ESP32\15-handheld\15-handheld\handheld\components\espressif__esp_lcd_touch_ft5x06
+      path: E:\source\ESP32\ESP32-C3-handheld\components\espressif__esp_lcd_touch_ft5x06
       type: local
     version: 1.0.6
   espressif/zlib:

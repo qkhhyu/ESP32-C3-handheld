@@ -14,6 +14,7 @@
 #include "freertos/task.h"
 #include "main.h"
 #include "weather_app.h"
+#include "power_mgmt.h"
 
 LV_FONT_DECLARE(font_alipuhui20);
 LV_FONT_DECLARE(font_myawesome);
@@ -412,6 +413,13 @@ static void comp_event_handler(lv_event_t * e)
 }
 
 /******************************** 第六个图标 设置应用程序 ******************************/
+static void power_save_switch_cb(lv_event_t * e)
+{
+    lv_obj_t * sw = lv_event_get_target(e);
+    bool enabled = lv_obj_has_state(sw, LV_STATE_CHECKED);
+    power_mgmt_set_enabled(enabled);
+}
+
 static void slider_event_cb(lv_event_t * e)
 {
     int x;
@@ -421,9 +429,10 @@ static void slider_event_cb(lv_event_t * e)
     x = lv_slider_get_value(slider);
     bg_duty = (float)x/100; // 根据滑动条的值计算占空比
     // 设置占空比
-    ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, 8191*(1-bg_duty)); 
+    ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, 8191*(1-bg_duty));
     // 更新背光
     ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
+    power_mgmt_set_brightness(bg_duty);
 }
 
 // 进入设置界面
@@ -431,35 +440,54 @@ static void set_event_handler(lv_event_t * e)
 {
     static lv_style_t style;
     lv_style_init(&style);
-    lv_style_set_radius(&style, 10);  
+    lv_style_set_radius(&style, 10);
     lv_style_set_bg_opa( &style, LV_OPA_COVER );
     lv_style_set_bg_color(&style, lv_color_hex(0xE680FF));
     lv_style_set_bg_grad_color( &style, lv_color_hex( 0xE68000 ) );
     lv_style_set_bg_grad_dir( &style, LV_GRAD_DIR_VER );
     lv_style_set_border_width(&style, 0);
     lv_style_set_pad_all(&style, 0);
-    lv_style_set_width(&style, 320);  
-    lv_style_set_height(&style, 240); 
+    lv_style_set_width(&style, 320);
+    lv_style_set_height(&style, 240);
 
     icon_in_obj = lv_obj_create(lv_scr_act());
     lv_obj_add_style(icon_in_obj, &style, 0);
 
-    // 创建文字提示
+    // 节能模式开关
+    lv_obj_t * power_label = lv_label_create(icon_in_obj);
+    lv_obj_set_style_text_color(power_label, lv_color_hex(0xffffff), 0);
+    lv_obj_set_style_text_font(power_label, &font_alipuhui20, 0);
+    lv_obj_align(power_label, LV_ALIGN_CENTER, 0, -80);
+    lv_label_set_text(power_label, "节能模式");
+
+    lv_obj_t * power_hint = lv_label_create(icon_in_obj);
+    lv_obj_set_style_text_color(power_hint, lv_color_hex(0xcccccc), 0);
+    lv_obj_set_style_text_font(power_hint, &font_alipuhui20, 0);
+    lv_obj_align(power_hint, LV_ALIGN_CENTER, 0, -58);
+    lv_label_set_text(power_hint, "18:30熄屏，触屏唤醒亮1分钟");
+
+    lv_obj_t * power_switch = lv_switch_create(icon_in_obj);
+    lv_obj_align(power_switch, LV_ALIGN_CENTER, 0, -30);
+    lv_obj_add_event_cb(power_switch, power_save_switch_cb, LV_EVENT_VALUE_CHANGED, NULL);
+    if (power_mgmt_is_enabled()) {
+        lv_obj_add_state(power_switch, LV_STATE_CHECKED);
+    }
+
+    // 亮度调节
     lv_obj_t * text_label = lv_label_create(icon_in_obj);
     lv_obj_set_style_text_color(text_label, lv_color_hex(0xffffff), 0);
     lv_obj_set_style_text_font(text_label, &font_alipuhui20, 0);
-    lv_obj_align(text_label, LV_ALIGN_CENTER, 0, -80);
+    lv_obj_align(text_label, LV_ALIGN_CENTER, 0, 10);
     lv_label_set_text(text_label, "滑动调节屏幕亮度");
 
-    // 创建一个滑动条
     lv_obj_t * slider = lv_slider_create(icon_in_obj);
     lv_slider_set_value(slider, bg_duty*100 , 0);
-    lv_obj_center(slider);
+    lv_obj_align(slider, LV_ALIGN_CENTER, 0, 55);
     lv_obj_set_height(slider, 50);
     lv_obj_add_event_cb(slider, slider_event_cb, LV_EVENT_VALUE_CHANGED, NULL);
 
     icon_flag = 6; // 标记已经进入第六个图标应用
-    
+
     // 绘制退出提示符
     lv_obj_t * label = lv_label_create(icon_in_obj);
     lv_label_set_text(label, LV_SYMBOL_UP);
@@ -470,7 +498,7 @@ static void set_event_handler(lv_event_t * e)
     lv_obj_add_event_cb(icon_in_obj, my_gesture_event_cb, LV_EVENT_GESTURE, NULL);
     lv_obj_clear_flag(icon_in_obj, LV_OBJ_FLAG_GESTURE_BUBBLE);
     lv_obj_add_flag(icon_in_obj, LV_OBJ_FLAG_CLICKABLE);
-    
+
 }
 
 
@@ -511,7 +539,7 @@ void lv_main_page(void)
     lv_obj_set_style_text_font(text_label, &font_alipuhui20, 0);
     lv_label_set_long_mode(text_label, LV_LABEL_LONG_SCROLL_CIRCULAR);     /*Circular scroll*/
     lv_obj_set_width(text_label, 120);
-    lv_label_set_text(text_label, "欢迎使用立创实战派开发板");
+    lv_label_set_text(text_label, "广告位招租，联系钟羽邮箱qkhhyu@163.com");
     lv_obj_align_to(text_label, main_obj, LV_ALIGN_TOP_LEFT, 8, 8);
 
     // 设置应用图标style

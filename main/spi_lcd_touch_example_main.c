@@ -50,6 +50,7 @@
 #include "audio.h"
 #include "main.h"
 #include "weather_service.h"
+#include "power_mgmt.h"
 
 static const char *TAG = "example";
 
@@ -126,6 +127,7 @@ static void example_lvgl_touch_cb(lv_indev_drv_t * drv, lv_indev_data_t * data)
     bool touchpad_pressed = esp_lcd_touch_get_coordinates(drv->user_data, touchpad_x, touchpad_y, NULL, &touchpad_cnt, 1);
 
     if (touchpad_pressed && touchpad_cnt > 0) {
+        power_mgmt_notify_touch();
         data->point.x = touchpad_x[0];
         data->point.y = touchpad_y[0];
         data->state = LV_INDEV_STATE_PRESSED;
@@ -314,7 +316,7 @@ void app_main(void)
     // 初始化LVGL
     ESP_LOGI(TAG, "Initialize LVGL library");
     lv_init();
-    
+
     lv_color_t *buf1 = heap_caps_malloc(EXAMPLE_LCD_H_RES * 20 * sizeof(lv_color_t), MALLOC_CAP_DMA);
     assert(buf1);
     lv_color_t *buf2 = heap_caps_malloc(EXAMPLE_LCD_H_RES * 20 * sizeof(lv_color_t), MALLOC_CAP_DMA);
@@ -367,6 +369,9 @@ void app_main(void)
     lv_gui_start(); // 显示开机界面
 
     my_event_group = xEventGroupCreate();
+
+    power_mgmt_init(panel_handle);  // 初始化电源管理（熄屏/唤醒）
+    power_mgmt_set_brightness(bg_duty);
 
     weather_service_init();
 
