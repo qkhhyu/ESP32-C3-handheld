@@ -346,16 +346,25 @@ static esp_err_t weather_refresh_once(bool refresh_daily)
         return ret;
     }
     connected = true;
-    weather_set_status("正在获取网络时间");
 
-    weather_snapshot_t snapshot;
-    weather_service_get_snapshot(&snapshot);
-    if (!snapshot.time_synced || refresh_daily) {
-        ret = weather_sync_time();
-        if (ret != ESP_OK) {
-            ESP_LOGW(TAG, "Time sync failed, continue to fetch weather");
-            time_sync_failed = true;
-        }
+    // WiFi 已连上，单次阻塞同步时间
+    esp_sntp_config_t sntp_cfg = ESP_NETIF_SNTP_DEFAULT_CONFIG("pool.ntp.org");
+    sntp_cfg.start = true;
+    esp_netif_sntp_init(&sntp_cfg);
+    for (int i = 0; i < 10 && time(NULL) < 1700000000; i++) {
+        esp_netif_sntp_sync_wait(pdMS_TO_TICKS(2000));
+    }
+    esp_netif_sntp_deinit();
+
+    if (time(NULL) > 1700000000) {
+        setenv("TZ", "CST-8", 1);
+        tzset();
+        xSemaphoreTake(s_weather_lock, portMAX_DELAY);
+        s_weather_snapshot.time_synced = true;
+        xSemaphoreGive(s_weather_lock);
+        ESP_LOGI(TAG, "Time synced: %lld", (long long)time(NULL));
+    } else {
+        ESP_LOGW(TAG, "Time sync failed");
     }
 
     if (refresh_daily) {
@@ -432,7 +441,7 @@ void weather_service_init(void)
     }
 
     s_weather_started = true;
-    xTaskCreate(weather_background_task, "weather_background_task", 10240, NULL, 5, NULL);
+    xTaskCreate(weather_background_task, "weather_bg", 10240, NULL, 5, NULL);
 }
 
 void weather_service_get_snapshot(weather_snapshot_t *snapshot)

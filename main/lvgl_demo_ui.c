@@ -15,6 +15,7 @@
 #include "main.h"
 #include "weather_app.h"
 #include "power_mgmt.h"
+#include "chip_power.h"
 
 LV_FONT_DECLARE(font_alipuhui20);
 LV_FONT_DECLARE(font_myawesome);
@@ -64,6 +65,7 @@ static void my_gesture_event_cb(lv_event_t * e)
     {
         if(icon_flag == 1)
         {
+            chip_power_exit_low_power();
             weather_app_close();
         }
         if((icon_flag == 2)||(icon_flag == 4)||(icon_flag == 5))
@@ -80,6 +82,8 @@ static void my_gesture_event_cb(lv_event_t * e)
 
 static void th_event_handler(lv_event_t * e)
 {
+    chip_power_enter_low_power();
+
     icon_in_obj = lv_obj_create(lv_scr_act());
     icon_flag = 1;
     weather_app_open(icon_in_obj);

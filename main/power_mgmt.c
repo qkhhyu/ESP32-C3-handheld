@@ -76,7 +76,7 @@ static void screen_turn_on(void)
 static void power_mgmt_task(void *arg)
 {
     while (1) {
-        vTaskDelay(pdMS_TO_TICKS(1000));
+        vTaskDelay(pdMS_TO_TICKS(2000));
 
         if (!s_enabled) {
             if (s_state != SCREEN_ON) {

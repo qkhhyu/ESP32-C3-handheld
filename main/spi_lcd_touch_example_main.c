@@ -51,6 +51,7 @@
 #include "main.h"
 #include "weather_service.h"
 #include "power_mgmt.h"
+#include "chip_power.h"
 
 static const char *TAG = "example";
 
@@ -80,7 +81,7 @@ static const char *TAG = "example";
 #define EXAMPLE_LCD_CMD_BITS           8
 #define EXAMPLE_LCD_PARAM_BITS         8
 
-#define EXAMPLE_LVGL_TICK_PERIOD_MS    2
+#define EXAMPLE_LVGL_TICK_PERIOD_MS    10
 
 esp_lcd_touch_handle_t tp = NULL;
 
@@ -180,26 +181,27 @@ void get_th_task(void *args)
 
     while(1)
     {
+        int interval_ms = chip_power_get_sample_interval_ms();
+        int sample_count = (interval_ms >= 2000) ? 2 : 10;
+
         ret = gxhtc3_get_tah(); // 获取一次温湿度
         if (ret!=ESP_OK) {
-            ESP_LOGE(TAG,"GXHTC3 READ TAH ERROR."); 
+            ESP_LOGE(TAG,"GXHTC3 READ TAH ERROR.");
         }
         else{ // 如果成功获取数据
             temp_sum = temp_sum + temp; // 温度累计和
             humi_sum = humi_sum + humi; // 湿度累计和
             date_cnt++; // 记录累计次数
         }
-        vTaskDelay(100 / portTICK_PERIOD_MS); // 延时100毫秒
-        time_cnt++; // 每100毫秒+1
-        if(time_cnt>10) // 1秒钟到
+
+        vTaskDelay(interval_ms / sample_count / portTICK_PERIOD_MS);
+        time_cnt++;
+        if(time_cnt >= sample_count)
         {
-            // 取平均数 且把结果四舍五入为整数
-            temp_value = round(temp_sum/date_cnt); 
-            humi_value = round(humi_sum/date_cnt); 
-            // 各标志位清零
+            temp_value = round(temp_sum/date_cnt);
+            temp_value = temp_value-2;//温度纠偏
+            humi_value = round(humi_sum/date_cnt);
             time_cnt = 0; date_cnt = 0; temp_sum = 0; humi_sum = 0;
-            // 标记温湿度有新数值
-            //th_update_flag = 1; 
             ESP_LOGI(TAG, "TEMP:%d HUMI:%d", temp_value, humi_value);
         }
     }
@@ -321,7 +323,7 @@ void app_main(void)
     assert(buf1);
     lv_color_t *buf2 = heap_caps_malloc(EXAMPLE_LCD_H_RES * 20 * sizeof(lv_color_t), MALLOC_CAP_DMA);
     assert(buf2);
-    
+
     lv_disp_draw_buf_init(&disp_buf, buf1, buf2, EXAMPLE_LCD_H_RES * 20);
 
     ESP_LOGI(TAG, "Register display driver to LVGL");
@@ -373,6 +375,8 @@ void app_main(void)
     power_mgmt_init(panel_handle);  // 初始化电源管理（熄屏/唤醒）
     power_mgmt_set_brightness(bg_duty);
 
+    chip_power_init();
+
     weather_service_init();
 
     xTaskCreate(get_th_task, "get_th_task", 4096, NULL, 5, NULL);
@@ -382,7 +386,7 @@ void app_main(void)
 
     while (1) {
         // raise the task priority of LVGL and/or reduce the handler period can improve the performance
-        vTaskDelay(pdMS_TO_TICKS(10));
+        vTaskDelay(pdMS_TO_TICKS(30));
         // The task running lv_timer_handler should have lower priority than that running `lv_tick_inc`
         lv_timer_handler();
     }
