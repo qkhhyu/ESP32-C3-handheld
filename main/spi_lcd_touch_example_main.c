@@ -209,19 +209,9 @@ void get_th_task(void *args)
 }
 
 
-// 主界面 任务函数
-static void main_page_task(void *pvParameters)
-{
-    xEventGroupWaitBits(my_event_group, START_MUSIC_DOWN, pdFALSE, pdFALSE, portMAX_DELAY);
-    lv_main_page();
-
-    while (1)
-    {
-        vTaskDelay(pdMS_TO_TICKS(1000));    
-    }
-    
-    vTaskDelete(NULL);
-}
+// 注意：主界面必须在调用 lv_timer_handler 的同一个任务里创建。
+// LVGL 不是线程安全的，如果放在其它任务里创建/删除控件，
+// 会和渲染循环竞争，破坏 LVGL 内部内存池，导致随机死机。
 
 // 主函数
 void app_main(void)
@@ -382,11 +372,16 @@ void app_main(void)
     xTaskCreate(get_th_task, "get_th_task", 4096, NULL, 5, NULL);
 
     xTaskCreate(power_music_task, "power_music_task", 4096, NULL, 5, NULL); // 播放开机音乐
-    xTaskCreate(main_page_task, "main_page_task", 8192, NULL, 5, NULL);
 
+    bool main_page_created = false;
     while (1) {
         // raise the task priority of LVGL and/or reduce the handler period can improve the performance
         vTaskDelay(pdMS_TO_TICKS(30));
+        // 开机音乐播放完毕后在 LVGL 任务内创建主界面（保证 LVGL 单线程访问）
+        if (!main_page_created && (xEventGroupGetBits(my_event_group) & START_MUSIC_DOWN)) {
+            lv_main_page();
+            main_page_created = true;
+        }
         // The task running lv_timer_handler should have lower priority than that running `lv_tick_inc`
         lv_timer_handler();
     }

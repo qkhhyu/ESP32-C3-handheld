@@ -15,7 +15,10 @@
 #include "esp_log.h"
 #include "esp_netif.h"
 #include "esp_netif_sntp.h"
+#include "esp_system.h"
+#include "esp_timer.h"
 #include "esp_tls.h"
+#include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
@@ -36,10 +39,12 @@ static const char *TAG = "weather_service";
 static SemaphoreHandle_t s_weather_lock;
 static char *s_http_compressed_buffer;
 static char *s_http_json_buffer;
+static int s_http_rx_len; // 本次请求实际收到的字节数（chunked 响应没有 content-length）
 static weather_snapshot_t s_weather_snapshot = {
     .status = "正在获取天气信息",
 };
 static bool s_weather_started;
+static esp_timer_handle_t s_wifi_connect_watchdog;
 
 static void weather_set_status(const char *status)
 {
@@ -54,46 +59,18 @@ static void weather_set_status(const char *status)
 
 static esp_err_t weather_http_event_handler(esp_http_client_event_t *evt)
 {
-    static char *output_buffer;
-    static int output_len;
-
     switch (evt->event_id) {
     case HTTP_EVENT_ON_DATA:
-        if (!esp_http_client_is_chunked_response(evt->client)) {
-            int copy_len = 0;
-
-            if (evt->user_data) {
-                int remaining = WEATHER_HTTP_BUFFER_SIZE - output_len - 1;
-                copy_len = evt->data_len < remaining ? evt->data_len : remaining;
-                if (copy_len > 0) {
-                    memcpy((char *)evt->user_data + output_len, evt->data, copy_len);
-                }
-            } else {
-                const int buffer_len = esp_http_client_get_content_length(evt->client);
-                if (output_buffer == NULL) {
-                    output_buffer = (char *)malloc(buffer_len);
-                    output_len = 0;
-                    if (output_buffer == NULL) {
-                        ESP_LOGE(TAG, "Failed to allocate response buffer");
-                        return ESP_FAIL;
-                    }
-                }
-
-                copy_len = evt->data_len;
-                memcpy(output_buffer + output_len, evt->data, copy_len);
+        // 不区分是否 chunked：gzip 响应经常以 chunked 方式传输，
+        // 原来只在非 chunked 时拷贝会把数据整个丢掉。
+        if (evt->user_data) {
+            int remaining = WEATHER_HTTP_BUFFER_SIZE - s_http_rx_len - 1;
+            int copy_len = evt->data_len < remaining ? evt->data_len : remaining;
+            if (copy_len > 0) {
+                memcpy((char *)evt->user_data + s_http_rx_len, evt->data, copy_len);
+                s_http_rx_len += copy_len;
             }
-
-            output_len += copy_len;
         }
-        break;
-
-    case HTTP_EVENT_ON_FINISH:
-    case HTTP_EVENT_DISCONNECTED:
-        if (output_buffer != NULL) {
-            free(output_buffer);
-            output_buffer = NULL;
-        }
-        output_len = 0;
         break;
 
     default:
@@ -103,7 +80,36 @@ static esp_err_t weather_http_event_handler(esp_http_client_event_t *evt)
     return ESP_OK;
 }
 
-static int gzip_decompress(char *src, int src_len, char *dst, int *dst_len)
+// 解析 gzip 头部长度（跳过可选字段），失败返回 -1
+static int gzip_header_len(const unsigned char *src, int src_len)
+{
+    if (src_len < 10 || src[0] != 0x1f || src[1] != 0x8b || src[2] != 8) {
+        return -1;
+    }
+
+    int flags = src[3];
+    int pos = 10;
+    if (flags & 0x04) { // FEXTRA
+        if (src_len < pos + 2) {
+            return -1;
+        }
+        pos += 2 + (src[pos] | (src[pos + 1] << 8));
+    }
+    if (flags & 0x08) { // FNAME：以 \0 结尾
+        while (pos < src_len && src[pos]) pos++;
+        pos++;
+    }
+    if (flags & 0x10) { // FCOMMENT：以 \0 结尾
+        while (pos < src_len && src[pos]) pos++;
+        pos++;
+    }
+    if (flags & 0x02) { // FHCRC
+        pos += 2;
+    }
+    return (pos < src_len) ? pos : -1;
+}
+
+static int inflate_raw(char *src, int src_len, char *dst, int *dst_len, int window_bits)
 {
     z_stream strm = {
         .zalloc = Z_NULL,
@@ -115,7 +121,7 @@ static int gzip_decompress(char *src, int src_len, char *dst, int *dst_len)
         .next_out = (Bytef *)dst,
     };
 
-    int ret = inflateInit2(&strm, 31);
+    int ret = inflateInit2(&strm, window_bits);
     if (ret != Z_OK) {
         return ret;
     }
@@ -127,6 +133,23 @@ static int gzip_decompress(char *src, int src_len, char *dst, int *dst_len)
     inflateEnd(&strm);
 
     return ret;
+}
+
+static int gzip_decompress(char *src, int src_len, char *dst, int *dst_len)
+{
+    // 本机堆内存紧张（TLS 峰值时只剩几 KB）：先尝试 2KB 小窗口
+    // raw inflate，内存峰值比标准 32KB 窗口低约 30KB。天气 JSON 很小，
+    // 回溯距离通常远小于 2KB；个别流不满足时回退标准 gzip 模式。
+    int header = gzip_header_len((const unsigned char *)src, src_len);
+    if (header > 0) {
+        int ret = inflate_raw(src + header, src_len - header, dst, dst_len, -11);
+        if (ret == Z_STREAM_END) {
+            return ret;
+        }
+        ESP_LOGW(TAG, "small window inflate failed(%d), fallback to full window", ret);
+    }
+
+    return inflate_raw(src, src_len, dst, dst_len, 31);
 }
 
 static esp_err_t weather_http_buffers_init(void)
@@ -155,11 +178,13 @@ static esp_err_t http_get_gzip_json(const char *url, char *json_buffer, size_t j
     ESP_RETURN_ON_ERROR(weather_http_buffers_init(), TAG, "allocate weather http buffer failed");
 
     memset(s_http_compressed_buffer, 0, WEATHER_HTTP_BUFFER_SIZE);
+    s_http_rx_len = 0;
     esp_http_client_config_t config = {
         .url = url,
         .event_handler = weather_http_event_handler,
         .crt_bundle_attach = esp_crt_bundle_attach,
         .user_data = s_http_compressed_buffer,
+        .timeout_ms = 15000, // 网络异常时避免 perform 无限期阻塞后台任务
     };
     esp_http_client_handle_t client = esp_http_client_init(&config);
     if (client == NULL) {
@@ -167,22 +192,21 @@ static esp_err_t http_get_gzip_json(const char *url, char *json_buffer, size_t j
     }
 
     esp_err_t err = esp_http_client_perform(client);
+    int status_code = esp_http_client_get_status_code(client);
+    int rx_len = s_http_rx_len;
+    esp_http_client_cleanup(client);
+
     if (err != ESP_OK) {
-        esp_http_client_cleanup(client);
         return err;
     }
 
-    int status_code = esp_http_client_get_status_code(client);
-    int content_len = esp_http_client_get_content_length(client);
-    esp_http_client_cleanup(client);
-
-    if (status_code != 200 || content_len <= 0 || content_len >= WEATHER_HTTP_BUFFER_SIZE) {
+    if (status_code != 200 || rx_len <= 0 || rx_len >= WEATHER_HTTP_BUFFER_SIZE) {
         return ESP_FAIL;
     }
 
     int out_len = (int)json_buffer_size - 1;
     memset(json_buffer, 0, json_buffer_size);
-    int zret = gzip_decompress(s_http_compressed_buffer, content_len, json_buffer, &out_len);
+    int zret = gzip_decompress(s_http_compressed_buffer, rx_len, json_buffer, &out_len);
     if (zret != Z_STREAM_END) {
         return ESP_FAIL;
     }
@@ -335,11 +359,24 @@ static esp_err_t weather_fetch_air(void)
     return ESP_OK;
 }
 
+static void wifi_connect_watchdog_cb(void *arg)
+{
+    // example_connect 内部用 portMAX_DELAY 等 IP 信号量，
+    // 路由器异常（不回 DHCP 等）时会永远阻塞；这里强制断开，
+    // 让它走失败重试路径，避免后台任务从此卡死。
+    ESP_LOGW(TAG, "example_connect stuck, forcing wifi disconnect");
+    esp_wifi_disconnect();
+}
+
 static esp_err_t weather_refresh_once(bool refresh_daily)
 {
     bool connected = false;
     bool time_sync_failed = false;
+    ESP_LOGI(TAG, "weather refresh begin: heap free=%u min=%u",
+             (unsigned)esp_get_free_heap_size(), (unsigned)esp_get_minimum_free_heap_size());
+    esp_timer_start_once(s_wifi_connect_watchdog, 25 * 1000 * 1000);
     esp_err_t ret = example_connect();
+    esp_timer_stop(s_wifi_connect_watchdog); // 定时器可能已触发，忽略返回值
     if (ret != ESP_OK) {
         example_disconnect();
         weather_set_status("正在连接WiFi");
@@ -347,14 +384,10 @@ static esp_err_t weather_refresh_once(bool refresh_daily)
     }
     connected = true;
 
-    // WiFi 已连上，单次阻塞同步时间
-    esp_sntp_config_t sntp_cfg = ESP_NETIF_SNTP_DEFAULT_CONFIG("pool.ntp.org");
-    sntp_cfg.start = true;
-    esp_netif_sntp_init(&sntp_cfg);
+    // 等待 SNTP 同步（SNTP 在 weather_service_init 已初始化一次，WiFi连上后自动同步）
     for (int i = 0; i < 10 && time(NULL) < 1700000000; i++) {
-        esp_netif_sntp_sync_wait(pdMS_TO_TICKS(2000));
+        vTaskDelay(pdMS_TO_TICKS(2000));
     }
-    esp_netif_sntp_deinit();
 
     if (time(NULL) > 1700000000) {
         setenv("TZ", "CST-8", 1);
@@ -440,22 +473,37 @@ void weather_service_init(void)
         ESP_ERROR_CHECK(ret);
     }
 
+    esp_sntp_config_t sntp_cfg = ESP_NETIF_SNTP_DEFAULT_CONFIG("pool.ntp.org");
+    esp_netif_sntp_init(&sntp_cfg);
+
+    const esp_timer_create_args_t watchdog_args = {
+        .callback = &wifi_connect_watchdog_cb,
+        .name = "wifi_wdt",
+    };
+    ESP_ERROR_CHECK(esp_timer_create(&watchdog_args, &s_wifi_connect_watchdog));
+
     s_weather_started = true;
-    xTaskCreate(weather_background_task, "weather_bg", 10240, NULL, 5, NULL);
+    // 优先级与 LVGL 任务相同（1）：联网/解压是后台工作，
+    // 高于界面优先级时会把 80MHz 的界面卡住好几秒，看起来像死机
+    xTaskCreate(weather_background_task, "weather_bg", 10240, NULL, 1, NULL);
 }
 
 void weather_service_get_snapshot(weather_snapshot_t *snapshot)
 {
+    // UI 定时器里调用：只允许有限等待，拿不到锁时用上一次的数据，
+    // 保证后台任务再怎么异常也不会把界面卡死
+    static weather_snapshot_t s_ui_cache = {
+        .status = "正在获取天气信息",
+    };
+
     if (snapshot == NULL) {
         return;
     }
 
-    memset(snapshot, 0, sizeof(*snapshot));
-    if (s_weather_lock == NULL) {
-        return;
+    if (s_weather_lock != NULL && xSemaphoreTake(s_weather_lock, pdMS_TO_TICKS(100)) == pdTRUE) {
+        s_ui_cache = s_weather_snapshot;
+        xSemaphoreGive(s_weather_lock);
     }
 
-    xSemaphoreTake(s_weather_lock, portMAX_DELAY);
-    *snapshot = s_weather_snapshot;
-    xSemaphoreGive(s_weather_lock);
+    *snapshot = s_ui_cache;
 }
