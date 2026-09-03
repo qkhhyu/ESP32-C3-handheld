@@ -63,6 +63,11 @@ static void my_gesture_event_cb(lv_event_t * e)
     lv_dir_t dir = lv_indev_get_gesture_dir(lv_indev_get_act());
     if(dir == LV_DIR_TOP)
     {
+        // 长滑动可能连续触发多次手势事件：不设防会把同一对象删除两次，
+        // 释放后内存再释放会破坏 LVGL 对象树（表现为启动器消失、全黑屏）
+        if (icon_in_obj == NULL) {
+            return;
+        }
         if(icon_flag == 1)
         {
             chip_power_exit_low_power();
@@ -73,8 +78,14 @@ static void my_gesture_event_cb(lv_event_t * e)
             lv_timer_del(my_lv_timer);
             my_lv_timer = NULL;
         }
-        lv_obj_del(icon_in_obj); 
+        lv_obj_del(icon_in_obj);
+        icon_in_obj = NULL;
         icon_flag = 0;
+        return;
+    }
+    if (icon_flag == 1 && weather_app_handle_gesture(dir))
+    {
+        return;
     }
 }
 

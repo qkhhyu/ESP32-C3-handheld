@@ -4,6 +4,7 @@ managed_components/
 .idea/
 
 main/weather_secrets.h
+main/usage_secrets.h
 
 *.bin
 *.elf

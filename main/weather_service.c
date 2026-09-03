@@ -3,7 +3,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/time.h>
 #include <time.h>
 
 #include "cJSON.h"
@@ -11,18 +10,19 @@
 #include "esp_crt_bundle.h"
 #include "esp_err.h"
 #include "esp_event.h"
+#include "esp_heap_caps.h"
 #include "esp_http_client.h"
 #include "esp_log.h"
 #include "esp_netif.h"
 #include "esp_netif_sntp.h"
-#include "esp_system.h"
-#include "esp_timer.h"
-#include "esp_tls.h"
 #include "esp_wifi.h"
+#include "esp_wifi_default.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/event_groups.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
-#include "protocol_examples_common.h"
+#include "sdkconfig.h"
+#include "usage_service.h"
 #include "weather_secrets.h"
 #include "zlib.h"
 
@@ -30,7 +30,13 @@ static const char *TAG = "weather_service";
 
 #define WEATHER_HTTP_BUFFER_SIZE 4096
 #define WEATHER_RETRY_MS         (60 * 1000)
-#define WEATHER_REFRESH_MS       (30 * 60 * 1000)
+#define WEATHER_WIFI_TIMEOUT_MS  (25 * 1000)
+#define WEATHER_WIFI_MAX_RETRY   6
+/* Weather and AI usage intentionally share this Wi-Fi/TLS cycle. */
+#define WEATHER_REFRESH_MS       (10 * 60 * 1000)
+
+#define WIFI_CONNECTED_BIT BIT0
+#define WIFI_FAILED_BIT    BIT1
 
 #define QWEATHER_DAILY_URL "https://devapi.qweather.com/v7/weather/3d?location=" QWEATHER_LOCATION_ID "&key=" QWEATHER_API_KEY
 #define QWEATHER_NOW_URL   "https://devapi.qweather.com/v7/weather/now?location=" QWEATHER_LOCATION_ID "&key=" QWEATHER_API_KEY
@@ -44,7 +50,146 @@ static weather_snapshot_t s_weather_snapshot = {
     .status = "正在获取天气信息",
 };
 static bool s_weather_started;
-static esp_timer_handle_t s_wifi_connect_watchdog;
+static esp_netif_t *s_wifi_netif;
+static EventGroupHandle_t s_wifi_event_group;
+static volatile bool s_wifi_cycle_active;
+static int s_wifi_retry_count;
+
+static void weather_log_heap(const char *stage)
+{
+    const uint32_t caps = MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT;
+    ESP_LOGI(TAG, "heap %-13s free=%u min=%u largest=%u",
+             stage,
+             (unsigned)heap_caps_get_free_size(caps),
+             (unsigned)heap_caps_get_minimum_free_size(caps),
+             (unsigned)heap_caps_get_largest_free_block(caps));
+}
+
+static void weather_wifi_event_handler(void *arg, esp_event_base_t event_base,
+                                       int32_t event_id, void *event_data)
+{
+    (void)arg;
+
+    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        if (!s_wifi_cycle_active) {
+            return;
+        }
+
+        if (++s_wifi_retry_count <= WEATHER_WIFI_MAX_RETRY) {
+            ESP_LOGW(TAG, "WiFi disconnected, retry %d/%d",
+                     s_wifi_retry_count, WEATHER_WIFI_MAX_RETRY);
+            esp_err_t ret = esp_wifi_connect();
+            if (ret != ESP_OK) {
+                ESP_LOGW(TAG, "esp_wifi_connect retry failed: %s", esp_err_to_name(ret));
+                xEventGroupSetBits(s_wifi_event_group, WIFI_FAILED_BIT);
+            }
+        } else {
+            xEventGroupSetBits(s_wifi_event_group, WIFI_FAILED_BIT);
+        }
+    } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP && s_wifi_cycle_active) {
+        ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
+        ESP_LOGI(TAG, "Got IPv4: " IPSTR, IP2STR(&event->ip_info.ip));
+        xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
+    }
+}
+
+static esp_err_t weather_wifi_init_once(void)
+{
+    s_wifi_event_group = xEventGroupCreate();
+    if (s_wifi_event_group == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    /* Keep the driver, netif and handlers for the device lifetime. Recreating
+       this entire graph every refresh leaked a small amount in IDF internals. */
+    s_wifi_netif = esp_netif_create_default_wifi_sta();
+    if (s_wifi_netif == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    wifi_init_config_t init_cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_RETURN_ON_ERROR(esp_wifi_init(&init_cfg), TAG, "esp_wifi_init failed");
+    ESP_RETURN_ON_ERROR(esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_STA_DISCONNECTED,
+                                                    weather_wifi_event_handler, NULL),
+                        TAG, "register WiFi handler failed");
+    ESP_RETURN_ON_ERROR(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP,
+                                                    weather_wifi_event_handler, NULL),
+                        TAG, "register IP handler failed");
+
+    wifi_config_t wifi_cfg = {
+        .sta = {
+            .ssid = CONFIG_EXAMPLE_WIFI_SSID,
+            .password = CONFIG_EXAMPLE_WIFI_PASSWORD,
+            .scan_method = WIFI_ALL_CHANNEL_SCAN,
+            .sort_method = WIFI_CONNECT_AP_BY_SIGNAL,
+            .threshold.rssi = -127,
+            .threshold.authmode = WIFI_AUTH_OPEN,
+        },
+    };
+    ESP_RETURN_ON_ERROR(esp_wifi_set_storage(WIFI_STORAGE_RAM), TAG, "set WiFi storage failed");
+    ESP_RETURN_ON_ERROR(esp_wifi_set_mode(WIFI_MODE_STA), TAG, "set WiFi mode failed");
+    ESP_RETURN_ON_ERROR(esp_wifi_set_config(WIFI_IF_STA, &wifi_cfg), TAG, "set WiFi config failed");
+    return ESP_OK;
+}
+
+static void weather_wifi_stop(void);
+
+static esp_err_t weather_wifi_connect(void)
+{
+    xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT | WIFI_FAILED_BIT);
+    s_wifi_retry_count = 0;
+    s_wifi_cycle_active = true;
+
+    esp_err_t ret = esp_wifi_start();
+    if (ret != ESP_OK) {
+        s_wifi_cycle_active = false;
+        ESP_LOGE(TAG, "esp_wifi_start failed: %s", esp_err_to_name(ret));
+        return ret;
+    }
+    weather_log_heap("wifi started");
+
+    ret = esp_wifi_connect();
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "esp_wifi_connect failed: %s", esp_err_to_name(ret));
+        weather_wifi_stop();
+        return ret;
+    }
+
+    EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group,
+                                           WIFI_CONNECTED_BIT | WIFI_FAILED_BIT,
+                                           pdTRUE, pdFALSE,
+                                           pdMS_TO_TICKS(WEATHER_WIFI_TIMEOUT_MS));
+    if ((bits & WIFI_CONNECTED_BIT) != 0) {
+        weather_log_heap("IP acquired");
+        return ESP_OK;
+    }
+
+    weather_wifi_stop();
+    if ((bits & WIFI_FAILED_BIT) != 0) {
+        ESP_LOGE(TAG, "WiFi connection failed after %d retries", s_wifi_retry_count);
+        return ESP_FAIL;
+    }
+    ESP_LOGE(TAG, "WiFi connection timed out after %d ms", WEATHER_WIFI_TIMEOUT_MS);
+    return ESP_ERR_TIMEOUT;
+}
+
+static void weather_wifi_stop(void)
+{
+    s_wifi_cycle_active = false;
+
+    esp_err_t ret = esp_wifi_disconnect();
+    if (ret != ESP_OK && ret != ESP_ERR_WIFI_NOT_CONNECT) {
+        ESP_LOGW(TAG, "esp_wifi_disconnect failed: %s", esp_err_to_name(ret));
+    }
+    ret = esp_wifi_stop();
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "esp_wifi_stop failed: %s", esp_err_to_name(ret));
+    }
+
+    /* Let pending disconnect events run before recording the cycle baseline. */
+    vTaskDelay(pdMS_TO_TICKS(100));
+    weather_log_heap("wifi stopped");
+}
 
 static void weather_set_status(const char *status)
 {
@@ -215,51 +360,6 @@ static esp_err_t http_get_gzip_json(const char *url, char *json_buffer, size_t j
     return ESP_OK;
 }
 
-static esp_err_t weather_sync_time_once(const char *server)
-{
-    esp_sntp_config_t config = ESP_NETIF_SNTP_DEFAULT_CONFIG(server);
-    esp_netif_sntp_init(&config);
-
-    int retry = 0;
-    const int retry_count = 3;
-    while (esp_netif_sntp_sync_wait(pdMS_TO_TICKS(2000)) == ESP_ERR_TIMEOUT && ++retry < retry_count) {
-        ESP_LOGI(TAG, "Waiting for system time from %s... (%d/%d)", server, retry, retry_count);
-    }
-
-    esp_netif_sntp_deinit();
-    if (retry >= retry_count) {
-        return ESP_ERR_TIMEOUT;
-    }
-
-    setenv("TZ", "CST-8", 1);
-    tzset();
-
-    xSemaphoreTake(s_weather_lock, portMAX_DELAY);
-    s_weather_snapshot.time_synced = true;
-    xSemaphoreGive(s_weather_lock);
-
-    return ESP_OK;
-}
-
-static esp_err_t weather_sync_time(void)
-{
-    static const char *kNtpServers[] = {
-        "pool.ntp.org",
-        "ntp.aliyun.com",
-        "ntp.tencent.com",
-    };
-
-    for (size_t i = 0; i < sizeof(kNtpServers) / sizeof(kNtpServers[0]); ++i) {
-        esp_err_t ret = weather_sync_time_once(kNtpServers[i]);
-        if (ret == ESP_OK) {
-            return ESP_OK;
-        }
-        ESP_LOGW(TAG, "Time sync via %s failed: %s", kNtpServers[i], esp_err_to_name(ret));
-    }
-
-    return ESP_ERR_TIMEOUT;
-}
-
 static esp_err_t weather_fetch_daily(void)
 {
     ESP_RETURN_ON_ERROR(weather_http_buffers_init(), TAG, "allocate weather json buffer failed");
@@ -359,32 +459,27 @@ static esp_err_t weather_fetch_air(void)
     return ESP_OK;
 }
 
-static void wifi_connect_watchdog_cb(void *arg)
-{
-    // example_connect 内部用 portMAX_DELAY 等 IP 信号量，
-    // 路由器异常（不回 DHCP 等）时会永远阻塞；这里强制断开，
-    // 让它走失败重试路径，避免后台任务从此卡死。
-    ESP_LOGW(TAG, "example_connect stuck, forcing wifi disconnect");
-    esp_wifi_disconnect();
-}
-
 static esp_err_t weather_refresh_once(bool refresh_daily)
 {
     bool connected = false;
     bool time_sync_failed = false;
-    ESP_LOGI(TAG, "weather refresh begin: heap free=%u min=%u",
-             (unsigned)esp_get_free_heap_size(), (unsigned)esp_get_minimum_free_heap_size());
-    esp_timer_start_once(s_wifi_connect_watchdog, 25 * 1000 * 1000);
-    esp_err_t ret = example_connect();
-    esp_timer_stop(s_wifi_connect_watchdog); // 定时器可能已触发，忽略返回值
+    weather_log_heap("cycle begin");
+
+    esp_err_t ret = weather_wifi_connect();
     if (ret != ESP_OK) {
-        example_disconnect();
         weather_set_status("正在连接WiFi");
         return ret;
     }
     connected = true;
 
-    // 等待 SNTP 同步（SNTP 在 weather_service_init 已初始化一次，WiFi连上后自动同步）
+    // SNTP 随 WiFi 会话重建：开机即启动的 SNTP 在 WiFi 未连接时请求失败，
+    // LWIP 按指数退避重试（最长3分钟一次），导致拿到 IP 后时间迟迟不同步。
+    // 在联网窗口内重建服务，保证立刻开始全新请求（周期性重校时也顺便消除漂移）。
+    esp_netif_sntp_deinit(); // 上一周期可能还在运行，未初始化时返回错误可忽略
+    esp_sntp_config_t sntp_cfg = ESP_NETIF_SNTP_DEFAULT_CONFIG("ntp.aliyun.com");
+    esp_netif_sntp_init(&sntp_cfg);
+
+    // 等待 SNTP 同步
     for (int i = 0; i < 10 && time(NULL) < 1700000000; i++) {
         vTaskDelay(pdMS_TO_TICKS(2000));
     }
@@ -407,6 +502,7 @@ static esp_err_t weather_refresh_once(bool refresh_daily)
             weather_set_status("正在获取天气信息");
             goto cleanup;
         }
+        weather_log_heap("after daily");
     }
 
     weather_set_status("正在获取天气信息");
@@ -415,12 +511,18 @@ static esp_err_t weather_refresh_once(bool refresh_daily)
         weather_set_status("正在获取天气信息");
         goto cleanup;
     }
+    weather_log_heap("after current");
 
     ret = weather_fetch_air();
     if (ret != ESP_OK) {
         weather_set_status("正在获取天气信息");
         goto cleanup;
     }
+    weather_log_heap("after air");
+
+    // 顺带查询 GLM 额度（共用本次 WiFi 连接，失败不影响天气刷新）
+    usage_service_fetch();
+    weather_log_heap("after usage");
 
     if (time_sync_failed) {
         weather_set_status("获取天气信息成功");
@@ -430,7 +532,7 @@ static esp_err_t weather_refresh_once(bool refresh_daily)
 
 cleanup:
     if (connected) {
-        example_disconnect();
+        weather_wifi_stop();
     }
     return ret;
 }
@@ -473,14 +575,16 @@ void weather_service_init(void)
         ESP_ERROR_CHECK(ret);
     }
 
-    esp_sntp_config_t sntp_cfg = ESP_NETIF_SNTP_DEFAULT_CONFIG("pool.ntp.org");
-    esp_netif_sntp_init(&sntp_cfg);
+    ret = weather_wifi_init_once();
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to initialize WiFi lifecycle: %s", esp_err_to_name(ret));
+        return;
+    }
 
-    const esp_timer_create_args_t watchdog_args = {
-        .callback = &wifi_connect_watchdog_cb,
-        .name = "wifi_wdt",
-    };
-    ESP_ERROR_CHECK(esp_timer_create(&watchdog_args, &s_wifi_connect_watchdog));
+    // SNTP 不在这里初始化：随每个联网周期重建（见 weather_refresh_once），
+    // 避免 WiFi 未连接时的失败请求触发 LWIP 指数退避
+
+    usage_service_init();
 
     s_weather_started = true;
     // 优先级与 LVGL 任务相同（1）：联网/解压是后台工作，
@@ -501,6 +605,10 @@ void weather_service_get_snapshot(weather_snapshot_t *snapshot)
     }
 
     if (s_weather_lock != NULL && xSemaphoreTake(s_weather_lock, pdMS_TO_TICKS(100)) == pdTRUE) {
+        // 时间可能在两次联网周期之间同步成功（SNTP 后台重试），即时点亮界面时钟
+        if (!s_weather_snapshot.time_synced && time(NULL) > 1700000000) {
+            s_weather_snapshot.time_synced = true;
+        }
         s_ui_cache = s_weather_snapshot;
         xSemaphoreGive(s_weather_lock);
     }

@@ -11,6 +11,7 @@ static const char *TAG = "power_mgmt";
 
 #define NVS_NAMESPACE "power_mgmt"
 #define NVS_KEY_ENABLED "enabled"
+
 #define LEDC_MAX_DUTY 8191
 
 // 夜间熄屏时间范围（方便测试修改）
